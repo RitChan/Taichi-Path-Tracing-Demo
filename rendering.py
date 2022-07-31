@@ -45,15 +45,20 @@ class RenderingKernel:
             rel_x = i_f / float(self.canvas.width)
             rel_y = j_f / float(self.canvas.height)
             view_ray = self.camera.ray_cast(rel_x, rel_y)
+            min_t = 1000.1
+            hit = 0
             for k in range(self.triangles.shape[0]):
                 v0 = self.triangles[k][0, :].transpose()
                 v1 = self.triangles[k][1, :].transpose()
                 v2 = self.triangles[k][2, :].transpose()
                 n = (v1 - v0).cross(v2 - v0)
-                hit_record = ray_triangle_intersection(view_ray.o, view_ray.d, v0, v1, v2, n)
+                hit_record = ray_triangle_intersection(view_ray.o, view_ray.d, v0, v1, v2, n, 0.1, 1000.0)
                 if hit_record.hit == 1:
-                    self.canvas.buffer[i, j] = ti.Vector([1, 1, 1], dt=ti.f32)
-                    break
+                    hit = 1
+                    if hit_record.t < min_t:
+                        min_t = hit_record.t
+            if hit == 1:
+                self.canvas.buffer[i, j] = ti.Vector([min_t, min_t, min_t], ti.f32)
 
     @ti.func
     def sample(self, x, k_o):
@@ -112,9 +117,20 @@ class Canvas:
         for i, j in self.buffer:
             self.buffer[i, j] = color
 
+    @ti.kernel
+    def normalize(self, denominator: ti.float32):
+        for i, j in self.buffer:
+            self.buffer[i, j] = self.buffer[i, j] / denominator
+
+    @ti.kernel
+    def normalize_depth(self, a: ti.float32, b: ti.float32):
+        """pixel = |pixel - a| / b"""
+        for i, j in self.buffer:
+            self.buffer[i, j] = ti.abs(self.buffer[i, j] - ti.Vector([a, a, a], ti.f32)) / b
+
 
 @ti.func
-def ray_triangle_intersection(o, d, v0, v1, v2, n):
+def ray_triangle_intersection(o, d, v0, v1, v2, n, t0, t1):
     hit_record = HitRecord(hit=1, t=0)
     a = o - v0
     b = v1 - v0
