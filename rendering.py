@@ -27,7 +27,7 @@ class RenderingKernel:
     def __init__(self,
                  triangles: Sequence[Sequence],
                  materials: Sequence,
-                 lights: Sequence["Light"],
+                 lights: "Lights",
                  camera: "Camera",
                  canvas: "Canvas"):
         # Basic Parameters:
@@ -59,8 +59,8 @@ class RenderingKernel:
             if flag_query(hit_record.flag, HIT) == 1:
                 # self.canvas.buffer[i, j] = ti.Vector([hit_record.t, hit_record.t, hit_record.t], ti.f32)
                 if flag_query(hit_record.flag, IS_LIGHT) == 1:
-                    light = self.lights[0]
-                    self.canvas.buffer[i, j] = light.radiance(-view_ray.d) * light.color
+                    light_idx = hit_record.object_idx
+                    self.canvas.buffer[i, j] = self.lights.radiance(light_idx, -view_ray.d) * self.lights.get_vec3(light_idx, Lights.COLOR)
 
     @ti.func
     def sample(self, x, k_o):
@@ -70,9 +70,8 @@ class RenderingKernel:
     def direct_light_radiance_at(self, x, k_o, normal, material):
         result = float(0)
         k_o = k_o * ti.rsqrt(k_o.transpose() @ k_o)[0]
-        for i in ti.static(range(len(self.lights))):
-            light = self.lights[i]
-            sample = light.sample()
+        for i in ti.static(range(self.lights.floats.shape[0])):
+            sample = self.lights.sample(i)
             k_i = sample.pos - x
             dist_sqr = k_i.transpose() @ k_i
             dist = ti.sqrt(dist_sqr)
@@ -80,9 +79,9 @@ class RenderingKernel:
             shadow_ray = Ray(o=x, d=k_i)
             hit_record = self.ray_hit_nearest(shadow_ray, 0.1, dist + 1)
             if flag_query(hit_record.flag, HIT) and hit_record.t > dist - 1e-3:
-                radiance = light.radiance(-k_i)
-                cos_light = (light.normal.transpose() @ (-k_i))[0]
-                cos_x = (normal.transpose() @ (-k_i))[0] * ti.rsqrt(normal.transpose() @ normal)[0]
+                radiance = self.lights.radiance(i, -k_i)
+                cos_light = self.lights.get_vec3(i, Lights.NORMAL).dot(-k_i)
+                cos_x = normal.transpose().dot(-k_i) * ti.rsqrt(normal.norm_sqr())
                 result = result + brdf(material, k_i, k_o) * radiance * cos_x * cos_light / (dist_sqr * sample.prob)
         return result
 
@@ -99,8 +98,8 @@ class RenderingKernel:
                 result.flag = flag_set(result.flag, HIT)
                 result.t = hit_record.t
                 result.object_idx = i
-        for i in ti.static(range(len(self.lights))):
-            hit_record = self.lights[i].ray_hit(ray, t0, t1)
+        for i in ti.static(range(self.lights.floats.shape[0])):
+            hit_record = self.lights.ray_hit_light(i, ray, t0, t1)
             if flag_query(hit_record.flag, HIT) == 1 and hit_record.t < result.t:
                 result.flag = flag_set(result.flag, HIT | IS_LIGHT)
                 result.t = hit_record.t
@@ -143,33 +142,41 @@ class Camera:
 
 
 @ti.data_oriented
-class Light:
-    """Simple area light"""
+class Lights:
+    ORIGIN = 0
+    DIR_X = 3
+    DIR_Y = 6
+    NORMAL = 9
+    COLOR = 12
+    AREA = 13
+    IRRADIANCE = 14
 
-    def __init__(self, origin: Sequence, dir_x: Sequence, dir_y: Sequence, power: float, color: Sequence = (1, 1, 1)):
-        """
-        :param origin: 左下角
-        :param dir_x: 宽
-        :param dir_y: 高
+    def __init__(self, float_properties: Sequence):
+        float_properties = np.asarray(float_properties, dtype="f4")
+        float_properties = float_properties.reshape((-1, 17))
+        self.floats = ti.field(ti.f32, shape=float_properties.shape)
+        self.floats.from_numpy(float_properties)
 
-        normal = dir_x cross dir_y
-        """
-        self.origin = ti.Vector(origin, dt=ti.f32)
-        self.dir_x = ti.Vector(dir_x, dt=ti.f32)
-        self.dir_y = ti.Vector(dir_y, dt=ti.f32)
-        self.normal = ti.Vector(np.cross(dir_x, dir_y) / np.linalg.norm(np.cross(dir_x, dir_y)), dt=ti.f32)
-        self.area: ti.float32 = np.linalg.norm(self.dir_x) * np.linalg.norm(self.dir_y)
-        self.irradiance: ti.f32 = power / self.area
-        self.color = ti.Vector(color, dt=ti.f32)
+    @staticmethod
+    def make_light_data(origin, dir_x, dir_y, power, color) -> np.ndarray:
+        origin = np.asarray(origin, dtype="f4")
+        dir_x = np.asarray(dir_x, dtype="f4")
+        dir_y = np.asarray(dir_y, dtype="f4")
+        normal = np.cross(dir_x, dir_y)
+        area = np.linalg.norm(normal)
+        normal /= area
+        irradiance = power / area
+        color = np.asarray(color, dtype="f4")
+        return np.hstack([origin, dir_x, dir_y, normal, color, area, irradiance])
 
     @ti.func
-    def ray_hit(self, ray, t0, t1):
+    def ray_hit_light(self, light_idx: ti.i32, ray, t0: ti.f32, t1: ti.f32) -> HitRecord:
         result = HitRecord(flag=ZERO, t=0, object_idx=-1, material=ZERO)
-        o_diff = ray.o - self.origin
-        M = ti.Matrix([
-            [self.dir_x[0], self.dir_y[0], -ray.d[0]],
-            [self.dir_x[1], self.dir_y[1], -ray.d[1]],
-            [self.dir_x[2], self.dir_y[2], -ray.d[2]]])
+        origin = self.get_vec3(light_idx, Lights.ORIGIN)
+        dir_y = self.get_vec3(light_idx, Lights.DIR_Y)
+        dir_x = self.get_vec3(light_idx, Lights.DIR_X)
+        o_diff = ray.o - origin
+        M = ti.Matrix.cols([dir_x, dir_y, -ray.d])
         x = M.inverse() @ o_diff
         if 0 < x[0] < 1 and 0 < x[1] < 1 and t0 < x[2] < t1:
             result.flag = flag_set(result.flag, HIT | IS_LIGHT)
@@ -177,26 +184,35 @@ class Light:
         return result
 
     @ti.func
-    def sample(self):
+    def sample(self, light_idx: ti.i32) -> PointSample:
+        origin = self.get_vec3(light_idx, Lights.ORIGIN)
+        dir_y = self.get_vec3(light_idx, Lights.DIR_Y)
+        dir_x = self.get_vec3(light_idx, Lights.DIR_X)
         n0 = ti.random(ti.f32)
         n1 = ti.random(ti.f32)
-        pos = self.origin + n0 * self.dir_x + n1 * self.dir_y
+        pos = origin + n0 * dir_x + n1 * dir_y
         prob = 1 / self.area
         result = PointSample(pos=pos, prob=prob)
         return result
 
     @ti.func
-    def probability(self, x) -> ti.f32:
+    def probability(self, light_idx: ti.i32, x) -> ti.f32:
         return 1 / self.area
 
     @ti.func
-    def radiance(self, direction):
-        cos = (self.normal.transpose() @ direction)[0] * ti.rsqrt(direction.transpose() @ direction)[0]
+    def radiance(self, light_idx: ti.i32, direction):
+        normal = self.get_vec3(light_idx, Lights.NORMAL)
+        irradiance = self.floats[light_idx, Lights.IRRADIANCE]
+        cos = (normal.transpose() @ direction)[0] * ti.rsqrt(direction.transpose() @ direction)[0]
         sin = 1 - cos * cos
         result: ti.f32 = 0
         if cos > 1e-3:
-            result = self.irradiance / (2 * float(3.141593) * sin)
+            result = irradiance / (2 * float(3.141593) * sin)
         return result
+
+    @ti.func
+    def get_vec3(self, light_idx: ti.i32, base: ti.i32) -> Vector3f:
+        return ti.Vector([self.floats[light_idx, base], self.floats[light_idx, base + 1], self.floats[light_idx, base + 2]])
 
 
 @ti.data_oriented
