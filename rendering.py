@@ -48,19 +48,32 @@ class RenderingKernel:
         self.canvas = canvas
 
     @ti.kernel
-    def render(self):
+    def render(self, iter_count: ti.i32):
         for i, j in self.canvas.buffer:
+            iter_f = float(iter_count)
             i_f = float(i) + 0.5
             j_f = float(j) + 0.5
             rel_x = i_f / float(self.canvas.width)
             rel_y = j_f / float(self.canvas.height)
             view_ray = self.camera.ray_cast(rel_x, rel_y)
             hit_record = self.ray_hit_nearest(view_ray, 0.01, 1000.0)
+            iter_f_inv = 1 / iter_f
+            self.canvas.buffer[i, j] = self.canvas.buffer[i, j] * (iter_f - 1) * iter_f_inv
             if flag_query(hit_record.flag, HIT) == 1:
                 # self.canvas.buffer[i, j] = ti.Vector([hit_record.t, hit_record.t, hit_record.t], ti.f32)
+                L_s = ti.Vector([0, 0, 0], ti.f32)
                 if flag_query(hit_record.flag, IS_LIGHT) == 1:
                     light_idx = hit_record.object_idx
-                    self.canvas.buffer[i, j] = self.lights.radiance(light_idx, -view_ray.d) * self.lights.get_vec3(light_idx, Lights.COLOR)
+                    L_s = self.lights.radiance(light_idx, -view_ray.d) * self.lights.get_vec3(light_idx, Lights.COLOR)
+                else:
+                    triangle_idx = hit_record.object_idx
+                    x = view_ray.o + hit_record.t * view_ray.d
+                    v0 = self.triangles[triangle_idx][0, :].transpose()
+                    v1 = self.triangles[triangle_idx][1, :].transpose()
+                    v2 = self.triangles[triangle_idx][2, :].transpose()
+                    n = (v1 - v0).cross(v2 - v0)
+                    L_s = self.direct_light_radiance_at(x, -view_ray.d, n, ZERO) * ti.Vector([1, 0.5, 0.7], ti.f32)
+                self.canvas.buffer[i, j] = self.canvas.buffer[i, j] + iter_f_inv * L_s
 
     @ti.func
     def sample(self, x, k_o):
@@ -73,16 +86,18 @@ class RenderingKernel:
         for i in ti.static(range(self.lights.floats.shape[0])):
             sample = self.lights.sample(i)
             k_i = sample.pos - x
-            dist_sqr = k_i.transpose() @ k_i
+            dist_sqr = k_i.norm_sqr()
             dist = ti.sqrt(dist_sqr)
             k_i = k_i / dist
             shadow_ray = Ray(o=x, d=k_i)
-            hit_record = self.ray_hit_nearest(shadow_ray, 0.1, dist + 1)
-            if flag_query(hit_record.flag, HIT) and hit_record.t > dist - 1e-3:
+            hit_record = self.ray_hit_nearest(shadow_ray, 0.01, dist + 1)
+            if flag_query(hit_record.flag, HIT) == 1 and flag_query(hit_record.flag, IS_LIGHT) == 1 and hit_record.t > dist - 1e-3:
                 radiance = self.lights.radiance(i, -k_i)
                 cos_light = self.lights.get_vec3(i, Lights.NORMAL).dot(-k_i)
-                cos_x = normal.transpose().dot(-k_i) * ti.rsqrt(normal.norm_sqr())
-                result = result + brdf(material, k_i, k_o) * radiance * cos_x * cos_light / (dist_sqr * sample.prob)
+                cos_x = normal.dot(k_i) / normal.norm()
+                L_f = brdf(material, k_i, k_o) * radiance * cos_x * cos_light / (dist_sqr * sample.prob)
+                if L_f > 0:
+                    result = result + L_f
         return result
 
     @ti.func
@@ -93,17 +108,19 @@ class RenderingKernel:
             v1 = self.triangles[i][1, :].transpose()
             v2 = self.triangles[i][2, :].transpose()
             n = (v1 - v0).cross(v2 - v0)
-            hit_record = ray_triangle_intersection(ray.o, ray.d, v0, v1, v2, n, t0, t1)
-            if flag_query(hit_record.flag, HIT) == 1 and hit_record.t < result.t:
-                result.flag = flag_set(result.flag, HIT)
-                result.t = hit_record.t
-                result.object_idx = i
+            if ray.d.dot(n) < 0:
+                hit_record = ray_triangle_intersection(ray.o, ray.d, v0, v1, v2, n, t0, t1)
+                if flag_query(hit_record.flag, HIT) == 1 and hit_record.t < result.t:
+                    result.flag = flag_set(result.flag, HIT)
+                    result.t = hit_record.t
+                    result.object_idx = i
         for i in ti.static(range(self.lights.floats.shape[0])):
-            hit_record = self.lights.ray_hit_light(i, ray, t0, t1)
-            if flag_query(hit_record.flag, HIT) == 1 and hit_record.t < result.t:
-                result.flag = flag_set(result.flag, HIT | IS_LIGHT)
-                result.t = hit_record.t
-                result.object_idx = i
+            if ray.d.dot(self.lights.get_vec3(i, Lights.NORMAL)) < 0:
+                hit_record = self.lights.ray_hit_light(i, ray, t0, t1)
+                if flag_query(hit_record.flag, HIT) == 1 and hit_record.t < result.t:
+                    result.flag = flag_set(result.flag, HIT | IS_LIGHT)
+                    result.t = hit_record.t
+                    result.object_idx = i
         return result
 
 
@@ -148,8 +165,8 @@ class Lights:
     DIR_Y = 6
     NORMAL = 9
     COLOR = 12
-    AREA = 13
-    IRRADIANCE = 14
+    AREA = 15
+    IRRADIANCE = 16
 
     def __init__(self, float_properties: Sequence):
         float_properties = np.asarray(float_properties, dtype="f4")
@@ -191,7 +208,7 @@ class Lights:
         n0 = ti.random(ti.f32)
         n1 = ti.random(ti.f32)
         pos = origin + n0 * dir_x + n1 * dir_y
-        prob = 1 / self.area
+        prob = 1 / self.floats[light_idx, Lights.AREA]
         result = PointSample(pos=pos, prob=prob)
         return result
 
@@ -203,11 +220,10 @@ class Lights:
     def radiance(self, light_idx: ti.i32, direction):
         normal = self.get_vec3(light_idx, Lights.NORMAL)
         irradiance = self.floats[light_idx, Lights.IRRADIANCE]
-        cos = (normal.transpose() @ direction)[0] * ti.rsqrt(direction.transpose() @ direction)[0]
-        sin = 1 - cos * cos
+        cos = normal.dot(direction) * ti.rsqrt(normal.norm_sqr())
         result: ti.f32 = 0
-        if cos > 1e-3:
-            result = irradiance / (2 * float(3.141593) * sin)
+        if cos > 0:
+            result = irradiance / float(3.141593)
         return result
 
     @ti.func
