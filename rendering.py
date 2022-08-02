@@ -25,8 +25,7 @@ IS_LIGHT = 0x00000002
 @ti.data_oriented
 class RenderingKernel:
     def __init__(self,
-                 triangles: Sequence[Sequence],
-                 materials: Sequence,
+                 triangles: "Triangles",
                  lights: "Lights",
                  camera: "Camera",
                  canvas: "Canvas"):
@@ -36,13 +35,7 @@ class RenderingKernel:
         # (3) lights
         # (4) camera
         # (5) canvas
-        triangles = np.asarray(triangles, dtype="f4").reshape((-1, 3, 3))
-        materials = np.asarray(materials, dtype="i4")
-        assert len(materials) == len(triangles)
-        self.triangles = ti.Matrix.field(n=3, m=3, dtype=ti.f32, shape=triangles.shape[0])
-        self.triangles.from_numpy(triangles)
-        self.materials = ti.field(dtype=ti.int32, shape=materials.shape)
-        self.materials.from_numpy(materials)
+        self.triangles = triangles
         self.lights = lights
         self.camera = camera
         self.canvas = canvas
@@ -68,11 +61,8 @@ class RenderingKernel:
                 else:
                     triangle_idx = hit_record.object_idx
                     x = view_ray.o + hit_record.t * view_ray.d
-                    v0 = self.triangles[triangle_idx][0, :].transpose()
-                    v1 = self.triangles[triangle_idx][1, :].transpose()
-                    v2 = self.triangles[triangle_idx][2, :].transpose()
-                    n = (v1 - v0).cross(v2 - v0)
-                    L_s = self.direct_light_radiance_at(x, -view_ray.d, n, ZERO) * ti.Vector([1, 0.5, 0.7], ti.f32)
+                    n = self.triangles.get_vec3(triangle_idx, Triangles.N)
+                    L_s = self.direct_light_radiance_at(x, -view_ray.d, n, ZERO) * self.triangles.get_vec3(triangle_idx, Triangles.COLOR)
                 self.canvas.buffer[i, j] = self.canvas.buffer[i, j] + iter_f_inv * L_s
 
     @ti.func
@@ -103,11 +93,11 @@ class RenderingKernel:
     @ti.func
     def ray_hit_nearest(self, ray, t0, t1):
         result = HitRecord(flag=ZERO, t=t1, object_idx=-1, material=-1)
-        for i in range(self.triangles.shape[0]):
-            v0 = self.triangles[i][0, :].transpose()
-            v1 = self.triangles[i][1, :].transpose()
-            v2 = self.triangles[i][2, :].transpose()
-            n = (v1 - v0).cross(v2 - v0)
+        for i in range(self.triangles.floats.shape[0]):
+            v0 = self.triangles.get_vec3(i, Triangles.V0)
+            v1 = self.triangles.get_vec3(i, Triangles.V1)
+            v2 = self.triangles.get_vec3(i, Triangles.V2)
+            n = self.triangles.get_vec3(i, Triangles.N)
             if ray.d.dot(n) < 0:
                 hit_record = ray_triangle_intersection(ray.o, ray.d, v0, v1, v2, n, t0, t1)
                 if flag_query(hit_record.flag, HIT) == 1 and hit_record.t < result.t:
@@ -125,37 +115,39 @@ class RenderingKernel:
 
 
 @ti.data_oriented
-class Camera:
-    def __init__(self,
-                 eye: Sequence,
-                 forward: Sequence,
-                 up: Sequence,
-                 aspect_ratio: float,
-                 fov_degree: float = 60):
-        forward = np.asarray(forward)
-        forward = forward / np.linalg.norm(forward)
-        up = np.asarray(up)
-        right = np.cross(forward, up)
-        right = right / np.linalg.norm(right)
-        up = np.cross(right, forward)
-        self.eye = ti.Matrix(eye, dt=ti.f32)
-        self.forward = ti.Matrix(forward, dt=ti.f32)
-        self.up = ti.Matrix(up, dt=ti.f32)
-        self.right = ti.Matrix(right, dt=ti.f32)
-        self.width_f = ti.float32 = 1
-        self.height_f = ti.float32 = aspect_ratio
-        self.half_w: ti.float32 = self.width_f / 2
-        self.half_h: ti.float32 = self.height_f / 2
-        self.z_near: ti.float32 = self.half_h / math.tan(math.radians(fov_degree / 2))
+class Triangles:
+    # floats
+    V0 = 0
+    V1 = 3
+    V2 = 6
+    N = 9
+    COLOR = 12
+    # integers
+    MATERIAL = 0
+
+    def __init__(self, floats: Sequence, integers: Sequence = None):
+        floats = np.asarray(floats, dtype="f4").reshape((-1, 15))
+        self.floats = ti.field(ti.f32, shape=floats.shape)
+        self.floats.from_numpy(floats)
+        if integers is None:
+            integers = np.zeros(self.floats.shape[0], dtype="i4")
+        integers = np.asarray(integers, dtype="i4").reshape(-1)
+        self.integers = ti.field(ti.i32, shape=integers.shape)
+        self.integers.from_numpy(integers)
+
+    @staticmethod
+    def create(v0, v1, v2, color=(1, 1, 1)):
+        v0 = np.asarray(v0, dtype="f4")
+        v1 = np.asarray(v1, dtype="f4")
+        v2 = np.asarray(v2, dtype="f4")
+        n = np.cross(v1 - v0, v2 - v0)
+        n = n / np.linalg.norm(n)
+        color = np.asarray(color, dtype="f4")
+        return np.hstack((v0, v1, v2, n, color))
 
     @ti.func
-    def ray_cast(self, rel_x: ti.f32, rel_y: ti.f32) -> Ray:
-        p = self.eye + self.z_near * self.forward + \
-            (rel_x * self.width_f - self.half_w) * self.right + \
-            (rel_y * self.height_f - self.half_h) * self.up
-        d = p - self.eye
-        d = d * ti.rsqrt(d.transpose() @ d)[0]
-        return Ray(o=self.eye, d=d)
+    def get_vec3(self, triangle_idx: ti.i32, base: ti.i32) -> Vector3f:
+        return ti.Vector([self.floats[triangle_idx, base], self.floats[triangle_idx, base + 1], self.floats[triangle_idx, base + 2]], dt=ti.f32)
 
 
 @ti.data_oriented
@@ -175,7 +167,7 @@ class Lights:
         self.floats.from_numpy(float_properties)
 
     @staticmethod
-    def make_light_data(origin, dir_x, dir_y, power, color) -> np.ndarray:
+    def create(origin, dir_x, dir_y, power, color) -> np.ndarray:
         origin = np.asarray(origin, dtype="f4")
         dir_x = np.asarray(dir_x, dtype="f4")
         dir_y = np.asarray(dir_y, dtype="f4")
@@ -229,6 +221,40 @@ class Lights:
     @ti.func
     def get_vec3(self, light_idx: ti.i32, base: ti.i32) -> Vector3f:
         return ti.Vector([self.floats[light_idx, base], self.floats[light_idx, base + 1], self.floats[light_idx, base + 2]])
+
+
+@ti.data_oriented
+class Camera:
+    def __init__(self,
+                 eye: Sequence,
+                 forward: Sequence,
+                 up: Sequence,
+                 aspect_ratio: float,
+                 fov_degree: float = 60):
+        forward = np.asarray(forward)
+        forward = forward / np.linalg.norm(forward)
+        up = np.asarray(up)
+        right = np.cross(forward, up)
+        right = right / np.linalg.norm(right)
+        up = np.cross(right, forward)
+        self.eye = ti.Matrix(eye, dt=ti.f32)
+        self.forward = ti.Matrix(forward, dt=ti.f32)
+        self.up = ti.Matrix(up, dt=ti.f32)
+        self.right = ti.Matrix(right, dt=ti.f32)
+        self.width_f = ti.float32 = 1
+        self.height_f = ti.float32 = aspect_ratio
+        self.half_w: ti.float32 = self.width_f / 2
+        self.half_h: ti.float32 = self.height_f / 2
+        self.z_near: ti.float32 = self.half_h / math.tan(math.radians(fov_degree / 2))
+
+    @ti.func
+    def ray_cast(self, rel_x: ti.f32, rel_y: ti.f32) -> Ray:
+        p = self.eye + self.z_near * self.forward + \
+            (rel_x * self.width_f - self.half_w) * self.right + \
+            (rel_y * self.height_f - self.half_h) * self.up
+        d = p - self.eye
+        d = d * ti.rsqrt(d.transpose() @ d)[0]
+        return Ray(o=self.eye, d=d)
 
 
 @ti.data_oriented
