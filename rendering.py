@@ -28,46 +28,58 @@ class RenderingKernel:
                  triangles: "Triangles",
                  lights: "Lights",
                  camera: "Camera",
-                 canvas: "Canvas"):
+                 canvas: "Canvas",
+                 rr_prob: float = 0.8,
+                 max_depth: int = 8):
         # Basic Parameters:
         # (1) triangles: nx3 matrix where n%3 == 0
-        # (2) triangle material types
-        # (3) lights
-        # (4) camera
-        # (5) canvas
+        # (2) lights
+        # (3) camera
+        # (4) canvas
         self.triangles = triangles
         self.lights = lights
         self.camera = camera
         self.canvas = canvas
+        self.rr_prob = rr_prob  # Russian roulette probability
+        self.max_depth = max_depth
+        self.illuminance_stack = ti.field(ti.f32, self.canvas.buffer.shape + (max_depth, 2))
 
     @ti.kernel
     def render(self, iter_count: ti.i32):
         for i, j in self.canvas.buffer:
             iter_f = float(iter_count)
+            iter_f_inv = 1 / iter_f
             i_f = float(i) + 0.5
             j_f = float(j) + 0.5
             rel_x = i_f / float(self.canvas.width)
             rel_y = j_f / float(self.canvas.height)
-            view_ray = self.camera.ray_cast(rel_x, rel_y)
-            hit_record = self.ray_hit_nearest(view_ray, 0.01, 1000.0)
-            iter_f_inv = 1 / iter_f
             self.canvas.buffer[i, j] = self.canvas.buffer[i, j] * (iter_f - 1) * iter_f_inv
-            if flag_query(hit_record.flag, HIT) == 1:
-                # self.canvas.buffer[i, j] = ti.Vector([hit_record.t, hit_record.t, hit_record.t], ti.f32)
-                L_s = ti.Vector([0, 0, 0], ti.f32)
-                if flag_query(hit_record.flag, IS_LIGHT) == 1:
-                    light_idx = hit_record.object_idx
-                    L_s = self.lights.radiance(light_idx, -view_ray.d) * self.lights.get_vec3(light_idx, Lights.COLOR)
+            L_s = ti.Vector([0, 0, 0], ti.f32)
+            ray = self.camera.ray_cast(rel_x, rel_y)
+            for sp in ti.static(range(self.max_depth)):
+                hit_record = self.ray_hit_nearest(ray, 0.01, 1000.0)
+                if flag_query(hit_record.flag, HIT) == 1:
+                    # self.canvas.buffer[i, j] = ti.Vector([hit_record.t, hit_record.t, hit_record.t], ti.f32)
+                    x = ray.o + hit_record.t * ray.d
+                    k_o = -ray.d.normalized()
+                    if flag_query(hit_record.flag, IS_LIGHT) == 1:
+                        light_idx = hit_record.object_idx
+                        L_s = self.lights.radiance(light_idx, k_o) * self.lights.get_vec3(light_idx, Lights.COLOR)
+                    else:
+                        triangle_idx = hit_record.object_idx
+                        n = self.triangles.get_vec3(triangle_idx, Triangles.N)
+                        L_s = self.direct_light_radiance_at(x, k_o, n, ZERO) * self.triangles.get_vec3(triangle_idx, Triangles.COLOR)
                 else:
-                    triangle_idx = hit_record.object_idx
-                    x = view_ray.o + hit_record.t * view_ray.d
-                    n = self.triangles.get_vec3(triangle_idx, Triangles.N)
-                    L_s = self.direct_light_radiance_at(x, -view_ray.d, n, ZERO) * self.triangles.get_vec3(triangle_idx, Triangles.COLOR)
-                self.canvas.buffer[i, j] = self.canvas.buffer[i, j] + iter_f_inv * L_s
+                    break
+            self.canvas.buffer[i, j] = self.canvas.buffer[i, j] + iter_f_inv * L_s
 
     @ti.func
-    def sample(self, x, k_o):
-        pass
+    def set_stack(self, i: ti.i32, j: ti.i32, sp: ti.i32, idx: ti.i32, value: ti.f32):
+        self.illuminance_stack[i, j, sp, idx] = value
+
+    @ti.func
+    def get_stack(self, i: ti.i32, j: ti.i32, sp: ti.i32, idx: ti.i32) -> ti.f32:
+        return self.illuminance_stack[i, j, sp, idx]
 
     @ti.func
     def direct_light_radiance_at(self, x, k_o, normal, material):
