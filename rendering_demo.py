@@ -31,8 +31,8 @@ if __name__ == '__main__':
         Triangles.create([1, -3, 0], [1, 3, -6], [1, -3, -6], color=(0.0, 0.0, 1.0)),
         Triangles.create([1, -3, 0], [1, 3, 0], [1, 3, -6], color=(0.0, 0.0, 1.0)),
         # Back
-        Triangles.create([-1, -1, -4], [1, -1, -4], [1, 3, -4], color=(0.5, 1, 0.3)),
-        Triangles.create([-1, -1, -4], [1, 3, -4], [-1, 3, -4], color=(0.5, 1, 0.3)),
+        Triangles.create([-1, -1, -4], [1, -1, -4], [1, 3, -4], color=(1, 1, 1)),
+        Triangles.create([-1, -1, -4], [1, 3, -4], [-1, 3, -4], color=(1, 1, 1)),
         # Top
         Triangles.create([-1, 1.01, 0], [-1, 1.01, -4], [1, 1.01, -4], color=(1, 1, 1)),
         Triangles.create([-1, 1.01, 0], [1, 1.01, -4], [1, 1.01, 0], color=(1, 1, 1)),

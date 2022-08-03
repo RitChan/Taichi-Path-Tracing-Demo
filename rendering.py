@@ -13,6 +13,7 @@ Vector3f = ti.types.vector(3, ti.float32)
 Ray = ti.types.struct(o=Vector3f, d=Vector3f)
 HitRecord = ti.types.struct(flag=ti.int32, t=ti.float32, object_idx=ti.int32, material=ti.int32)
 PointSample = ti.types.struct(pos=Vector3f, prob=ti.float32)
+ReflectionSample = ti.types.struct(k=Vector3f, k_local=Vector3f, theta=ti.float32, phi=ti.float32, prob=ti.float32)
 
 # HitRecord Flags
 HIT = 0x00000001
@@ -40,46 +41,59 @@ class RenderingKernel:
         self.lights = lights
         self.camera = camera
         self.canvas = canvas
-        self.rr_prob = rr_prob  # Russian roulette probability
+        # self.rr_prob = rr_prob  # Russian roulette probability
         self.max_depth = max_depth
-        self.illuminance_stack = ti.field(ti.f32, self.canvas.buffer.shape + (max_depth, 2))
 
     @ti.kernel
     def render(self, iter_count: ti.i32):
         for i, j in self.canvas.buffer:
             iter_f = float(iter_count)
             iter_f_inv = 1 / iter_f
-            i_f = float(i) + 0.5
-            j_f = float(j) + 0.5
+            i_f = float(i) + ti.random(ti.f32)
+            j_f = float(j) + ti.random(ti.f32)
             rel_x = i_f / float(self.canvas.width)
             rel_y = j_f / float(self.canvas.height)
             self.canvas.buffer[i, j] = self.canvas.buffer[i, j] * (iter_f - 1) * iter_f_inv
-            L_s = ti.Vector([0, 0, 0], ti.f32)
+            L_s = ti.Vector([1, 1, 1], ti.f32)
             ray = self.camera.ray_cast(rel_x, rel_y)
-            for sp in ti.static(range(self.max_depth)):
+            for depth in range(self.max_depth):
                 hit_record = self.ray_hit_nearest(ray, 0.01, 1000.0)
                 if flag_query(hit_record.flag, HIT) == 1:
-                    # self.canvas.buffer[i, j] = ti.Vector([hit_record.t, hit_record.t, hit_record.t], ti.f32)
-                    x = ray.o + hit_record.t * ray.d
                     k_o = -ray.d.normalized()
                     if flag_query(hit_record.flag, IS_LIGHT) == 1:
                         light_idx = hit_record.object_idx
-                        L_s = self.lights.radiance(light_idx, k_o) * self.lights.get_vec3(light_idx, Lights.COLOR)
+                        L_s = L_s * self.lights.radiance(light_idx, k_o) * self.lights.get_vec3(light_idx, Lights.COLOR)
+                        break
                     else:
                         triangle_idx = hit_record.object_idx
-                        n = self.triangles.get_vec3(triangle_idx, Triangles.N)
-                        L_s = self.direct_light_radiance_at(x, k_o, n, ZERO) * self.triangles.get_vec3(triangle_idx, Triangles.COLOR)
+                        # n = self.triangles.get_vec3(triangle_idx, Triangles.N)
+                        reflection = self.sample_reflection(triangle_idx)
+                        # L_s = self.direct_light_radiance_at(x, k_o, n, ZERO) * self.triangles.get_vec3(triangle_idx, Triangles.COLOR)
+                        rho = brdf(self.triangles.integers[triangle_idx, Triangles.MATERIAL], reflection.k_local, k_o)
+                        L_s = L_s * rho * ti.cos(reflection.theta) * ti.sin(reflection.theta) * self.triangles.get_vec3(triangle_idx, Triangles.COLOR)/ reflection.prob
+                        x = ray.o + hit_record.t * ray.d
+                        ray = Ray(o=x, d=reflection.k.normalized())
                 else:
+                    # L_s = ti.Vector([0, 0, 0], ti.f32)
                     break
             self.canvas.buffer[i, j] = self.canvas.buffer[i, j] + iter_f_inv * L_s
 
     @ti.func
-    def set_stack(self, i: ti.i32, j: ti.i32, sp: ti.i32, idx: ti.i32, value: ti.f32):
-        self.illuminance_stack[i, j, sp, idx] = value
-
-    @ti.func
-    def get_stack(self, i: ti.i32, j: ti.i32, sp: ti.i32, idx: ti.i32) -> ti.f32:
-        return self.illuminance_stack[i, j, sp, idx]
+    def sample_reflection(self, triangle_idx: ti.i32) -> ReflectionSample:
+        theta = ti.acos(1 - ti.random(ti.f32))  # 仰角
+        phi = 2 * 3.141593 * ti.random(ti.f32)  # 方位角
+        cos_theta = ti.cos(theta)
+        sin_theta = ti.sin(theta)
+        x = sin_theta * ti.cos(phi)
+        y = sin_theta * ti.sin(phi)
+        z = cos_theta
+        k_local = ti.Vector([x, y, z], ti.f32)
+        v0 = self.triangles.get_vec3(triangle_idx, Triangles.V0)
+        v1 = self.triangles.get_vec3(triangle_idx, Triangles.V1)
+        vz = self.triangles.get_vec3(triangle_idx, Triangles.N)
+        vx = (v1 - v0).normalized()
+        vy = vz.cross(vx)
+        return ReflectionSample(k=vx * x + vy * y + vz * z, k_local=k_local, prob=1 / 6.283185, theta=theta, phi=phi)
 
     @ti.func
     def direct_light_radiance_at(self, x, k_o, normal, material):
@@ -143,7 +157,7 @@ class Triangles:
         self.floats.from_numpy(floats)
         if integers is None:
             integers = np.zeros(self.floats.shape[0], dtype="i4")
-        integers = np.asarray(integers, dtype="i4").reshape(-1)
+        integers = np.asarray(integers, dtype="i4").reshape((-1, 1))
         self.integers = ti.field(ti.i32, shape=integers.shape)
         self.integers.from_numpy(integers)
 
