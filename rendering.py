@@ -30,7 +30,6 @@ class RenderingKernel:
                  lights: "Lights",
                  camera: "Camera",
                  canvas: "Canvas",
-                 rr_prob: float = 0.8,
                  max_depth: int = 8):
         # Basic Parameters:
         # (1) triangles: nx3 matrix where n%3 == 0
@@ -41,7 +40,6 @@ class RenderingKernel:
         self.lights = lights
         self.camera = camera
         self.canvas = canvas
-        # self.rr_prob = rr_prob  # Russian roulette probability
         self.max_depth = max_depth
 
     @ti.kernel
@@ -66,15 +64,13 @@ class RenderingKernel:
                         break
                     else:
                         triangle_idx = hit_record.object_idx
-                        # n = self.triangles.get_vec3(triangle_idx, Triangles.N)
                         reflection = self.sample_reflection(triangle_idx)
-                        # L_s = self.direct_light_radiance_at(x, k_o, n, ZERO) * self.triangles.get_vec3(triangle_idx, Triangles.COLOR)
                         rho = brdf(self.triangles.integers[triangle_idx, Triangles.MATERIAL], reflection.k_local, k_o)
                         L_s = L_s * rho * ti.cos(reflection.theta) * ti.sin(reflection.theta) * self.triangles.get_vec3(triangle_idx, Triangles.COLOR)/ reflection.prob
                         x = ray.o + hit_record.t * ray.d
                         ray = Ray(o=x, d=reflection.k.normalized())
                 else:
-                    # L_s = ti.Vector([0, 0, 0], ti.f32)
+                    L_s = ti.Vector([0, 0, 0], ti.f32)
                     break
             self.canvas.buffer[i, j] = self.canvas.buffer[i, j] + iter_f_inv * L_s
 
