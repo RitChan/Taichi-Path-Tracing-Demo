@@ -41,10 +41,14 @@ class RenderingKernel:
         self.camera = camera
         self.canvas = canvas
         self.max_depth = max_depth
+        self.stack = Vector3f.field(shape=self.canvas.buffer.shape + (self.max_depth, 2))
 
     @ti.kernel
     def render(self, iter_count: ti.i32):
         for i, j in self.canvas.buffer:
+            for sp in ti.static(range(self.stack.shape[2] - 1, -1, -1)):
+                self.stack[i, j, sp, 0] = ti.Vector([0, 0, 0], ti.f32)
+                self.stack[i, j, sp, 1] = ti.Vector([0, 0, 0], ti.f32)
             iter_f = float(iter_count)
             iter_f_inv = 1 / iter_f
             i_f = float(i) + ti.random(ti.f32)
@@ -52,26 +56,39 @@ class RenderingKernel:
             rel_x = i_f / float(self.canvas.width)
             rel_y = j_f / float(self.canvas.height)
             self.canvas.buffer[i, j] = self.canvas.buffer[i, j] * (iter_f - 1) * iter_f_inv
-            L_s = ti.Vector([1, 1, 1], ti.f32)
             ray = self.camera.ray_cast(rel_x, rel_y)
+            L_s = ti.Vector([0, 0, 0], ti.f32)
             for depth in range(self.max_depth):
                 hit_record = self.ray_hit_nearest(ray, 0.01, 1000.0)
                 if flag_query(hit_record.flag, HIT) == 1:
                     k_o = -ray.d.normalized()
+                    x = ray.o + hit_record.t * ray.d
+                    direct = ti.Vector([0, 0, 0], ti.f32)
+                    indirect_coeff = ti.Vector([0, 0, 0], ti.f32)
+                    object_idx = hit_record.object_idx
                     if flag_query(hit_record.flag, IS_LIGHT) == 1:
-                        light_idx = hit_record.object_idx
-                        L_s = L_s * self.lights.radiance(light_idx, k_o) * self.lights.get_vec3(light_idx, Lights.COLOR)
-                        break
-                    else:
-                        triangle_idx = hit_record.object_idx
-                        reflection = self.sample_reflection(triangle_idx)
-                        rho = brdf(self.triangles.integers[triangle_idx, Triangles.MATERIAL], reflection.k_local, k_o)
-                        L_s = L_s * rho * ti.cos(reflection.theta) * ti.sin(reflection.theta) * self.triangles.get_vec3(triangle_idx, Triangles.COLOR)/ reflection.prob
-                        x = ray.o + hit_record.t * ray.d
+                        color = self.lights.get_vec3(object_idx, Lights.COLOR)
+                        if depth > 0:
+                            direct = self.direct_light_radiance_at(x, k_o, self.lights.get_vec3(object_idx, Lights.NORMAL), ZERO, object_idx) * color
+                        else:
+                            direct = self.lights.radiance(object_idx, k_o) * self.lights.get_vec3(object_idx, Lights.COLOR)
+                        reflection = self.sample_reflection_for_light(object_idx)
+                        rho = brdf(ZERO, reflection.k_local, k_o)
+                        indirect_coeff = rho * ti.cos(reflection.theta) * ti.sin(reflection.theta) * color / reflection.prob
                         ray = Ray(o=x, d=reflection.k.normalized())
+                    else:
+                        color = self.triangles.get_vec3(object_idx, Triangles.COLOR)
+                        direct = self.direct_light_radiance_at(x, k_o, self.triangles.get_vec3(object_idx, Triangles.N), self.triangles.integers[object_idx, Triangles.MATERIAL], -1) * color
+                        reflection = self.sample_reflection(object_idx)
+                        rho = brdf(self.triangles.integers[object_idx, Triangles.MATERIAL], reflection.k_local, k_o)
+                        indirect_coeff = rho * ti.cos(reflection.theta) * ti.sin(reflection.theta) * color / reflection.prob
+                        ray = Ray(o=x, d=reflection.k.normalized())
+                    self.stack[i, j, depth, 0] = direct
+                    self.stack[i, j, depth, 1] = indirect_coeff
                 else:
-                    L_s = ti.Vector([0, 0, 0], ti.f32)
                     break
+            for sp in ti.static(range(self.stack.shape[2] - 1, -1, -1)):
+                L_s = self.stack[i, j, sp, 0] + L_s * self.stack[i, j, sp, 1]
             self.canvas.buffer[i, j] = self.canvas.buffer[i, j] + iter_f_inv * L_s
 
     @ti.func
@@ -92,24 +109,40 @@ class RenderingKernel:
         return ReflectionSample(k=vx * x + vy * y + vz * z, k_local=k_local, prob=1 / 6.283185, theta=theta, phi=phi)
 
     @ti.func
-    def direct_light_radiance_at(self, x, k_o, normal, material):
+    def sample_reflection_for_light(self, light_idx: ti.i32) -> ReflectionSample:
+        theta = ti.acos(1 - ti.random(ti.f32))  # 仰角
+        phi = 2 * 3.141593 * ti.random(ti.f32)  # 方位角
+        cos_theta = ti.cos(theta)
+        sin_theta = ti.sin(theta)
+        x = sin_theta * ti.cos(phi)
+        y = sin_theta * ti.sin(phi)
+        z = cos_theta
+        k_local = ti.Vector([x, y, z], ti.f32)
+        vx = self.lights.get_vec3(light_idx, Lights.DIR_X).normalized()
+        vz = self.lights.get_vec3(light_idx, Triangles.N)
+        vy = vz.cross(vx)
+        return ReflectionSample(k=vx * x + vy * y + vz * z, k_local=k_local, prob=1 / 6.283185, theta=theta, phi=phi)
+
+    @ti.func
+    def direct_light_radiance_at(self, x, k_o, normal, material, exclude):
         result = float(0)
         k_o = k_o * ti.rsqrt(k_o.transpose() @ k_o)[0]
         for i in ti.static(range(self.lights.floats.shape[0])):
-            sample = self.lights.sample(i)
-            k_i = sample.pos - x
-            dist_sqr = k_i.norm_sqr()
-            dist = ti.sqrt(dist_sqr)
-            k_i = k_i / dist
-            shadow_ray = Ray(o=x, d=k_i)
-            hit_record = self.ray_hit_nearest(shadow_ray, 0.01, dist + 1)
-            if flag_query(hit_record.flag, HIT) == 1 and flag_query(hit_record.flag, IS_LIGHT) == 1 and hit_record.t > dist - 1e-3:
-                radiance = self.lights.radiance(i, -k_i)
-                cos_light = self.lights.get_vec3(i, Lights.NORMAL).dot(-k_i)
-                cos_x = normal.dot(k_i) / normal.norm()
-                L_f = brdf(material, k_i, k_o) * radiance * cos_x * cos_light / (dist_sqr * sample.prob)
-                if L_f > 0:
-                    result = result + L_f
+            if i != exclude:
+                sample = self.lights.sample(i)
+                k_i = sample.pos - x
+                dist_sqr = k_i.norm_sqr()
+                dist = ti.sqrt(dist_sqr)
+                k_i = k_i / dist
+                shadow_ray = Ray(o=x, d=k_i)
+                hit_record = self.ray_hit_nearest(shadow_ray, 0.01, dist + 1)
+                if flag_query(hit_record.flag, HIT) == 1 and flag_query(hit_record.flag, IS_LIGHT) == 1 and hit_record.t > dist - 1e-3:
+                    radiance = self.lights.radiance(i, -k_i)
+                    cos_light = self.lights.get_vec3(i, Lights.NORMAL).dot(-k_i)
+                    cos_x = normal.dot(k_i) / normal.norm()
+                    L_f = brdf(material, k_i, k_o) * radiance * cos_x * cos_light / (dist_sqr * sample.prob)
+                    if L_f > 0:
+                        result = result + L_f
         return result
 
     @ti.func
@@ -347,3 +380,95 @@ def flag_query(status: ti.i32, flag_type: ti.i32) -> ti.i32:
     if status & flag_type == flag_type:
         result = 1
     return result
+
+
+def main():
+    ti.init(arch=ti.cuda, default_fp=ti.f32, default_ip=ti.i32)
+
+    WIDTH, HEIGHT = 500, 500
+    BOX_POINTS = np.array([
+        [-0.5, -0.5, -0.5], [0.5, -0.5, -0.5], [0.5, 0.5, -0.5], [-0.5, 0.5, -0.5],
+        [-0.5, -0.5, 0.5], [0.5, -0.5, 0.5], [0.5, 0.5, 0.5], [-0.5, 0.5, 0.5],
+    ], dtype="f4")
+    BOX_SCALE = 0.8
+    BOX_POINTS *= BOX_SCALE
+
+    BOX1_ROT = np.array((
+        (0.38235995173454285, 0.06055793538689613, 0.3164389431476593),
+        (0.14269095659255981, 0.4084676206111908, -0.25058630108833313),
+        (-0.28886011242866516, 0.28193429112434387, 0.29508116841316223)
+    ), dtype="f4")
+    BOX1_TRANSLATE = np.array([-0.3, -0.1, -2.5])
+    BOX1 = (BOX1_ROT @ BOX_POINTS.T).T + BOX1_TRANSLATE
+
+    BOX2_ROT = np.array((
+        (0.3295649588108063, 0.31123486161231995, 0.21099717915058136),
+        (0.18337589502334595, 0.11190993338823318, -0.451496958732605),
+        (-0.32826852798461914, 0.37497878074645996, -0.04038276523351669)
+    ), dtype="f4")
+    BOX2_TRANSLATE = np.array([0.2, -0.4, -2.5])
+    BOX2 = (BOX2_ROT @ BOX_POINTS.T).T + BOX2_TRANSLATE
+
+    triangles = Triangles([
+        # Bottom
+        Triangles.create([-1, -1, 0], [1, -1, 0], [1, -1, -6], color=(1, 1, 1)),
+        Triangles.create([-1, -1, 0], [1, -1, -6], [-1, -1, -6], color=(1, 1, 1)),
+        # Left
+        Triangles.create([-1, -3, 0], [-1, -3, -6], [-1, 3, -6], color=(223 / 255, 99 / 255, 99 / 255)),
+        Triangles.create([-1, -3, 0], [-1, 3, -6], [-1, 3, 0], color=(223 / 255, 99 / 255, 99 / 255)),
+        # Right
+        Triangles.create([1, -3, 0], [1, 3, -6], [1, -3, -6], color=(91 / 255, 99 / 168, 79 / 255)),
+        Triangles.create([1, -3, 0], [1, 3, 0], [1, 3, -6], color=(91 / 255, 99 / 168, 79 / 255)),
+        # Back
+        Triangles.create([-1, -1, -4], [1, -1, -4], [1, 3, -4], color=(1, 1, 1)),
+        Triangles.create([-1, -1, -4], [1, 3, -4], [-1, 3, -4], color=(1, 1, 1)),
+        # Top
+        Triangles.create([-1, 1.01, 0], [-1, 1.01, -4], [1, 1.01, -4], color=(1, 1, 1)),
+        Triangles.create([-1, 1.01, 0], [1, 1.01, -4], [1, 1.01, 0], color=(1, 1, 1)),
+        # Box 1
+        Triangles.create(BOX1[0], BOX1[3], BOX1[1], color=(1, 1, 1)),
+        Triangles.create(BOX1[1], BOX1[3], BOX1[2], color=(1, 1, 1)),
+        Triangles.create(BOX1[4], BOX1[5], BOX1[7], color=(1, 1, 1)),
+        Triangles.create(BOX1[5], BOX1[6], BOX1[7], color=(1, 1, 1)),
+        Triangles.create(BOX1[0], BOX1[1], BOX1[5], color=(1, 1, 1)),
+        Triangles.create(BOX1[0], BOX1[5], BOX1[4], color=(1, 1, 1)),
+        Triangles.create(BOX1[3], BOX1[7], BOX1[6], color=(1, 1, 1)),
+        Triangles.create(BOX1[3], BOX1[6], BOX1[2], color=(1, 1, 1)),
+        Triangles.create(BOX1[1], BOX1[2], BOX1[6], color=(1, 1, 1)),
+        Triangles.create(BOX1[1], BOX1[6], BOX1[5], color=(1, 1, 1)),
+        Triangles.create(BOX1[0], BOX1[4], BOX1[3], color=(1, 1, 1)),
+        Triangles.create(BOX1[3], BOX1[4], BOX1[7], color=(1, 1, 1)),
+        # Box 2
+        Triangles.create(BOX2[0], BOX2[3], BOX2[1], color=(1, 1, 1)),
+        Triangles.create(BOX2[1], BOX2[3], BOX2[2], color=(1, 1, 1)),
+        Triangles.create(BOX2[4], BOX2[5], BOX2[7], color=(1, 1, 1)),
+        Triangles.create(BOX2[5], BOX2[6], BOX2[7], color=(1, 1, 1)),
+        Triangles.create(BOX2[0], BOX2[1], BOX2[5], color=(1, 1, 1)),
+        Triangles.create(BOX2[0], BOX2[5], BOX2[4], color=(1, 1, 1)),
+        Triangles.create(BOX2[3], BOX2[7], BOX2[6], color=(1, 1, 1)),
+        Triangles.create(BOX2[3], BOX2[6], BOX2[2], color=(1, 1, 1)),
+        Triangles.create(BOX2[1], BOX2[2], BOX2[6], color=(1, 1, 1)),
+        Triangles.create(BOX2[1], BOX2[6], BOX2[5], color=(1, 1, 1)),
+        Triangles.create(BOX2[0], BOX2[4], BOX2[3], color=(1, 1, 1)),
+        Triangles.create(BOX2[3], BOX2[4], BOX2[7], color=(1, 1, 1)),
+    ])
+    lights = Lights([
+        Lights.create(origin=[-0.7, 1, -3], dir_x=[1.4, 0, 0], dir_y=[0, 0, 1.4], power=16, color=(1, 1, 1))
+    ])
+    camera = Camera(eye=[0, 0, 0], forward=[0, 0, -1], up=[0, 1, 0], aspect_ratio=WIDTH / HEIGHT, fov_degree=60)
+    kernel = RenderingKernel(triangles, lights, camera, Canvas(WIDTH, HEIGHT))
+
+    kernel.canvas.clear(ti.Vector([0, 0, 0], dt=ti.float32))
+    # kernel.render(1)
+    iter_count = 1
+    gui = ti.GUI("Triangle", res=(WIDTH, HEIGHT))
+    while gui.running:
+        kernel.render(iter_count)
+        gui.set_image(kernel.canvas.buffer)
+        gui.show()
+        iter_count += 1
+        # print(f"\r                     \rIter={iter_count}", end="")
+
+
+if __name__ == "__main__":
+    main()
