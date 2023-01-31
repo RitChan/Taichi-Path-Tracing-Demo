@@ -126,7 +126,7 @@ class RenderingKernel:
     @ti.func
     def direct_light_radiance_at(self, x, k_o, normal, material, exclude):
         result = float(0)
-        k_o = k_o * ti.rsqrt(k_o.transpose() @ k_o)[0]
+        k_o = k_o / k_o.norm()
         for i in ti.static(range(self.lights.floats.shape[0])):
             if i != exclude:
                 sample = self.lights.sample(i)
@@ -308,7 +308,7 @@ class Camera:
             (rel_x * self.width_f - self.half_w) * self.right + \
             (rel_y * self.height_f - self.half_h) * self.up
         d = p - self.eye
-        d = d * ti.rsqrt(d.transpose() @ d)[0]
+        d = d / d.norm()
         return Ray(o=self.eye, d=d)
 
 
@@ -342,7 +342,7 @@ def ray_triangle_intersection(o, d, v0, v1, v2, n, t0, t1):
     a = o - v0
     b = v1 - v0
     c = v2 - v0
-    if ti.abs((a.transpose() @ n)[0]) < 1e-3:  # d与n平行, 我们认为没有交点
+    if a.norm() < 1e-3:  # d与n平行, 我们认为没有交点
         hit_record.flag = flag_clear(hit_record.flag, HIT)
     if flag_query(hit_record.flag, HIT) == 1:
         M = ti.Matrix([
